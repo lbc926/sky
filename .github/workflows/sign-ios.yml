@@ -1,0 +1,345 @@
+name: Patch and sign iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: Source IPA URL
+        required: true
+        default: https://sqi.pages.dev/ios.ipa
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sign-ios-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sign:
+    name: Patch, inject and sign
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      IPA_URL: ${{ inputs.ipa_url }}
+      CERT_ARCHIVE: aa1122.zip
+      DYLIB_FILE: 空内容永久关闭版.dylib
+      OUTPUT_IPA: Sky-patched-signed.ipa
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify repository inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$CERT_ARCHIVE"
+          test -f "$DYLIB_FILE"
+          echo "Certificate archive: $CERT_ARCHIVE"
+          echo "Injected dylib: $DYLIB_FILE"
+
+      - name: Download and extract source IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location \
+            --retry 5 --retry-all-errors --retry-delay 3 \
+            --connect-timeout 30 \
+            -H 'Cache-Control: no-cache' \
+            "$IPA_URL?t=$(date +%s)" \
+            --output source.ipa
+
+          python3 - <<'PY'
+          from pathlib import Path
+          ipa = Path("source.ipa")
+          with ipa.open("rb") as handle:
+              magic = handle.read(4)
+          if ipa.stat().st_size <= 0 or magic != b"PK\x03\x04":
+              raise SystemExit("Downloaded file is not a valid non-empty IPA/ZIP")
+          print(f"Downloaded {ipa.stat().st_size} bytes")
+          PY
+
+          rm -rf unpack
+          mkdir unpack
+          ditto -x -k source.ipa unpack
+          rm -f source.ipa
+
+          APP_PATH="$(find unpack/Payload -maxdepth 2 -type d -name '*.app' -print -quit)"
+          test -n "$APP_PATH"
+          INFO_PLIST="$APP_PATH/Info.plist"
+          test -f "$INFO_PLIST"
+          EXECUTABLE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$INFO_PLIST")"
+          EXECUTABLE_PATH="$APP_PATH/$EXECUTABLE_NAME"
+          test -f "$EXECUTABLE_PATH"
+
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+          echo "INFO_PLIST=$INFO_PLIST" >> "$GITHUB_ENV"
+          echo "EXECUTABLE_NAME=$EXECUTABLE_NAME" >> "$GITHUB_ENV"
+          echo "EXECUTABLE_PATH=$EXECUTABLE_PATH" >> "$GITHUB_ENV"
+          echo "App: $APP_PATH"
+          echo "Executable: $EXECUTABLE_NAME"
+
+      - name: Modify Info.plist and patch executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/libexec/PlistBuddy -c 'Set :SkyServerHostname sky.jljlb.vip' "$INFO_PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c 'Add :SkyServerHostname string sky.jljlb.vip' "$INFO_PLIST"
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["EXECUTABLE_PATH"])
+          data = path.read_bytes()
+
+          patches = [
+              (
+                  bytes.fromhex("000020400000803F"),
+                  bytes.fromhex("000080400000803F"),
+                  "float constant",
+              ),
+              (
+                  bytes.fromhex(
+                      "68 74 74 70 73 3A 2F 2F "
+                      "25 73 2F 61 63 63 6F 75 "
+                      "6E 74 2F 61 75 74 68 2F "
+                      "6F 61 75 74 68 5F 72 65 "
+                      "64 69 72 65 63 74 00 4D "
+                      "6F 7A 69 6C 6C 61 2F 35 "
+                      "2E 30 20 28 69 50 68 6F "
+                      "6E 65 3B 20 43 50 55 20 "
+                      "69 50 68 6F 6E 65"
+                  ),
+                  bytes.fromhex(
+                      "68 74 74 70 73 3A 2F 2F "
+                      "6C 69 76 65 2E 72 61 64 "
+                      "69 61 6E 63 65 2E 74 68 "
+                      "61 74 67 61 6D 65 63 6F "
+                      "6D 70 61 6E 79 2E 63 6F "
+                      "6D 2F 61 63 63 6F 75 6E "
+                      "74 2F 61 75 74 68 2F 6F "
+                      "61 75 74 68 5F 72 65 64 "
+                      "69 72 65 63 74 00"
+                  ),
+                  "OAuth redirect URL",
+              ),
+          ]
+
+          for old, new, label in patches:
+              if len(old) != len(new):
+                  raise SystemExit(f"{label}: patch lengths differ")
+              count = data.count(old)
+              if count == 0:
+                  raise SystemExit(f"{label}: source pattern not found")
+              data = data.replace(old, new, 1)
+              print(f"{label}: replaced first of {count} match(es)")
+
+          path.write_bytes(data)
+          PY
+
+          VALUE="$(/usr/libexec/PlistBuddy -c 'Print :SkyServerHostname' "$INFO_PLIST")"
+          test "$VALUE" = 'sky.jljlb.vip'
+
+      - name: Inject dylib into main executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-input --user 'lief==0.17.6'
+
+          mkdir -p "$APP_PATH/Frameworks"
+          INJECTED_NAME="DisableBlank.dylib"
+          INJECTED_PATH="$APP_PATH/Frameworks/$INJECTED_NAME"
+          cp "$DYLIB_FILE" "$INJECTED_PATH"
+          chmod 755 "$INJECTED_PATH"
+          echo "INJECTED_PATH=$INJECTED_PATH" >> "$GITHUB_ENV"
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import lief
+
+          executable = Path(os.environ["EXECUTABLE_PATH"])
+          load_path = "@executable_path/Frameworks/DisableBlank.dylib"
+          fat = lief.MachO.parse(str(executable), config=lief.MachO.ParserConfig.deep)
+          if fat is None or fat.size == 0:
+              raise SystemExit("Unable to parse the main Mach-O executable")
+
+          changed = 0
+          for binary in fat:
+              if binary.find_library(load_path) is None:
+                  if binary.add_library(load_path) is None:
+                      raise SystemExit(f"Unable to inject load command into {binary.header.cpu_type}")
+                  changed += 1
+
+          temporary = executable.with_suffix(executable.suffix + ".injected")
+          fat.write(str(temporary))
+          temporary.chmod(executable.stat().st_mode)
+          temporary.replace(executable)
+          print(f"Injected {load_path} into {changed} Mach-O slice(s)")
+          PY
+
+          otool -L "$EXECUTABLE_PATH" | grep -F '@executable_path/Frameworks/DisableBlank.dylib'
+          lipo -info "$EXECUTABLE_PATH"
+          lipo -info "$INJECTED_PATH"
+
+      - name: Import certificate and prepare provisioning profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf signing-material
+          mkdir signing-material
+          ditto -x -k "$CERT_ARCHIVE" signing-material
+
+          P12_FILE="$(find signing-material -type f -name '*.p12' -print -quit)"
+          PROFILE_FILE="$(find signing-material -type f -name '*.mobileprovision' -print -quit)"
+          PASSWORD_FILE="$(find signing-material -type f -name '*.txt' -print -quit)"
+          test -f "$P12_FILE"
+          test -f "$PROFILE_FILE"
+          test -f "$PASSWORD_FILE"
+          P12_PASSWORD="$(tr -d '\r\n' < "$PASSWORD_FILE")"
+          test -n "$P12_PASSWORD"
+
+          KEYCHAIN_PATH="$RUNNER_TEMP/ios-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$P12_FILE" -k "$KEYCHAIN_PATH" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+
+          SIGNING_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | sed -n 's/.*"\(.*\)"/\1/p' | head -n 1)"
+          test -n "$SIGNING_IDENTITY"
+          echo "SIGNING_IDENTITY=$SIGNING_IDENTITY" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+          security cms -D -i "$PROFILE_FILE" > profile.plist
+          cp "$PROFILE_FILE" "$APP_PATH/embedded.mobileprovision"
+
+          python3 - <<'PY'
+          import datetime
+          import fnmatch
+          import os
+          import plistlib
+          import subprocess
+
+          with open("profile.plist", "rb") as handle:
+              profile = plistlib.load(handle)
+          expiration = profile.get("ExpirationDate")
+          now = datetime.datetime.now(datetime.timezone.utc)
+          if expiration is None or expiration <= now:
+              raise SystemExit(f"Provisioning profile expired: {expiration}")
+
+          entitlements = profile["Entitlements"]
+          with open("entitlements.plist", "wb") as handle:
+              plistlib.dump(entitlements, handle, fmt=plistlib.FMT_XML, sort_keys=False)
+
+          app_id = str(entitlements.get("application-identifier", ""))
+          if "." not in app_id:
+              raise SystemExit("Provisioning profile has no valid application-identifier")
+          profile_bundle = app_id.split(".", 1)[1]
+          info_plist = os.environ["INFO_PLIST"]
+          current_bundle = subprocess.check_output(
+              ["/usr/libexec/PlistBuddy", "-c", "Print :CFBundleIdentifier", info_plist],
+              text=True,
+          ).strip()
+          if not fnmatch.fnmatchcase(current_bundle, profile_bundle):
+              if "*" in profile_bundle:
+                  raise SystemExit(
+                      f"Bundle ID {current_bundle} does not match profile pattern {profile_bundle}"
+                  )
+              subprocess.run(
+                  ["/usr/libexec/PlistBuddy", "-c", f"Set :CFBundleIdentifier {profile_bundle}", info_plist],
+                  check=True,
+              )
+              current_bundle = profile_bundle
+
+          print("Profile:", profile.get("Name"))
+          print("Profile expires:", expiration.isoformat())
+          print("Bundle ID:", current_bundle)
+          print("Team ID:", entitlements.get("com.apple.developer.team-identifier"))
+          PY
+
+          echo "Signing identity: $SIGNING_IDENTITY"
+
+      - name: Re-sign app bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$APP_PATH/_CodeSignature"
+
+          while IFS= read -r -d '' item; do
+            echo "Signing nested item: $item"
+            if [[ "$item" == *.appex ]]; then
+              codesign --force --sign "$SIGNING_IDENTITY" \
+                --keychain "$KEYCHAIN_PATH" \
+                --timestamp=none --generate-entitlement-der \
+                --preserve-metadata=identifier,entitlements \
+                "$item"
+            else
+              codesign --force --sign "$SIGNING_IDENTITY" \
+                --keychain "$KEYCHAIN_PATH" \
+                --timestamp=none --generate-entitlement-der \
+                "$item"
+            fi
+          done < <(find "$APP_PATH" -depth \( \
+            -type d -name '*.framework' -o \
+            -type d -name '*.appex' -o \
+            -type f -name '*.dylib' \
+          \) -print0)
+
+          codesign --force --sign "$SIGNING_IDENTITY" \
+            --keychain "$KEYCHAIN_PATH" \
+            --timestamp=none --generate-entitlement-der \
+            --entitlements entitlements.plist \
+            "$APP_PATH"
+
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          codesign -d --verbose=4 "$APP_PATH"
+
+      - name: Package signed IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f "$OUTPUT_IPA"
+          (
+            cd unpack
+            ditto -c -k --sequesterRsrc --keepParent Payload "../$OUTPUT_IPA"
+          )
+          test -s "$OUTPUT_IPA"
+          shasum -a 256 "$OUTPUT_IPA" | tee "$OUTPUT_IPA.sha256"
+          ls -lh "$OUTPUT_IPA" "$OUTPUT_IPA.sha256"
+
+          {
+            echo '## Signed IPA'
+            echo
+            echo "- Source: $IPA_URL"
+            echo '- SkyServerHostname: `sky.jljlb.vip`'
+            echo '- Injected: `DisableBlank.dylib`'
+            echo "- Output: $OUTPUT_IPA"
+            echo
+            echo '```text'
+            cat "$OUTPUT_IPA.sha256"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload signed IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sky-patched-signed
+          path: |
+            Sky-patched-signed.ipa
+            Sky-patched-signed.ipa.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+      - name: Remove temporary keychain
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${KEYCHAIN_PATH:-}" ]]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
