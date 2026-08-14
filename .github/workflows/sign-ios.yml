@@ -278,8 +278,14 @@ jobs:
           set -euo pipefail
           rm -rf "$APP_PATH/_CodeSignature"
 
+          # A nested app extension requires its own matching provisioning profile.
+          # The supplied archive contains only the main-app profile, so remove
+          # optional extensions instead of producing an invalid mixed-profile IPA.
+          rm -rf "$APP_PATH/PlugIns" "$APP_PATH/Watch"
+
           while IFS= read -r -d '' item; do
             echo "Signing nested item: $item"
+            codesign --remove-signature "$item" 2>/dev/null || true
             if [[ "$item" == *.appex ]]; then
               codesign --force --sign "$SIGNING_IDENTITY" \
                 --keychain "$KEYCHAIN_PATH" \
