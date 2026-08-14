@@ -7,6 +7,30 @@ on:
         description: Source IPA URL
         required: true
         default: https://sqi.pages.dev/ios.ipa
+      sky_server_hostname:
+        description: SkyServerHostname override (leave blank to preserve source value)
+        required: false
+        default: ''
+      hex_patch_1:
+        description: Custom hex patch 1 (OLD=>NEW)
+        required: false
+        default: ''
+      hex_patch_2:
+        description: Custom hex patch 2 (OLD=>NEW)
+        required: false
+        default: ''
+      hex_patch_3:
+        description: Custom hex patch 3 (OLD=>NEW)
+        required: false
+        default: ''
+      hex_patch_4:
+        description: Custom hex patch 4 (OLD=>NEW)
+        required: false
+        default: ''
+      hex_patch_5:
+        description: Custom hex patch 5 (OLD=>NEW)
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -22,9 +46,15 @@ jobs:
     timeout-minutes: 90
     env:
       IPA_URL: ${{ inputs.ipa_url }}
+      SKY_SERVER_HOSTNAME: ${{ inputs.sky_server_hostname }}
+      HEX_PATCH_1: ${{ inputs.hex_patch_1 }}
+      HEX_PATCH_2: ${{ inputs.hex_patch_2 }}
+      HEX_PATCH_3: ${{ inputs.hex_patch_3 }}
+      HEX_PATCH_4: ${{ inputs.hex_patch_4 }}
+      HEX_PATCH_5: ${{ inputs.hex_patch_5 }}
       CERT_ARCHIVE: aa1122.zip
       DYLIB_FILE: 空内容永久关闭版.dylib
-      OUTPUT_IPA: Sky-patched-signed.ipa
+      OUTPUT_IPA: ios.ipa
 
     steps:
       - name: Checkout repository
@@ -84,8 +114,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          /usr/libexec/PlistBuddy -c 'Set :SkyServerHostname sky.jljlb.vip' "$INFO_PLIST" 2>/dev/null || \
-            /usr/libexec/PlistBuddy -c 'Add :SkyServerHostname string sky.jljlb.vip' "$INFO_PLIST"
+          if [[ -n "$SKY_SERVER_HOSTNAME" ]]; then
+            /usr/libexec/PlistBuddy -c "Set :SkyServerHostname $SKY_SERVER_HOSTNAME" "$INFO_PLIST" 2>/dev/null || \
+              /usr/libexec/PlistBuddy -c "Add :SkyServerHostname string $SKY_SERVER_HOSTNAME" "$INFO_PLIST"
+            echo "SkyServerHostname updated to: $SKY_SERVER_HOSTNAME"
+          else
+            echo 'SkyServerHostname input is blank; preserving the source Info.plist value.'
+          fi
 
           python3 - <<'PY'
           import os
@@ -127,6 +162,24 @@ jobs:
               ),
           ]
 
+          for index in range(1, 6):
+              value = "".join(os.environ.get(f"HEX_PATCH_{index}", "").split())
+              if not value:
+                  print(f"custom patch {index}: blank; skipped")
+                  continue
+              if "=>" not in value:
+                  raise SystemExit(f"custom patch {index}: expected OLD=>NEW")
+              old_hex, new_hex = value.split("=>", 1)
+              try:
+                  old = bytes.fromhex(old_hex)
+                  new = bytes.fromhex(new_hex)
+              except ValueError as error:
+                  raise SystemExit(f"custom patch {index}: invalid hexadecimal: {error}") from error
+              if not old or not new:
+                  print(f"custom patch {index}: empty side; skipped")
+                  continue
+              patches.append((old, new, f"custom patch {index}"))
+
           for old, new, label in patches:
               if len(old) != len(new):
                   raise SystemExit(f"{label}: patch lengths differ")
@@ -138,13 +191,15 @@ jobs:
               elif new_count:
                   print(f"{label}: already patched ({new_count} target match(es)); leaving unchanged")
               else:
-                  raise SystemExit(f"{label}: neither source nor target pattern was found")
+                  print(f"{label}: source pattern not found; skipped")
 
           path.write_bytes(data)
           PY
 
-          VALUE="$(/usr/libexec/PlistBuddy -c 'Print :SkyServerHostname' "$INFO_PLIST")"
-          test "$VALUE" = 'sky.jljlb.vip'
+          if [[ -n "$SKY_SERVER_HOSTNAME" ]]; then
+            VALUE="$(/usr/libexec/PlistBuddy -c 'Print :SkyServerHostname' "$INFO_PLIST")"
+            test "$VALUE" = "$SKY_SERVER_HOSTNAME"
+          fi
 
       - name: Inject dylib into main executable
         shell: bash
@@ -333,7 +388,11 @@ jobs:
             echo '## Signed IPA'
             echo
             echo "- Source: $IPA_URL"
-            echo '- SkyServerHostname: `sky.jljlb.vip`'
+            if [[ -n "$SKY_SERVER_HOSTNAME" ]]; then
+              echo "- SkyServerHostname: \`$SKY_SERVER_HOSTNAME\`"
+            else
+              echo '- SkyServerHostname: preserved from source IPA'
+            fi
             echo '- Injected: `DisableBlank.dylib`'
             echo "- Output: $OUTPUT_IPA"
             echo
@@ -342,16 +401,52 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload signed IPA artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Sky-patched-signed
-          path: |
-            Sky-patched-signed.ipa
-            Sky-patched-signed.ipa.sha256
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 3
+      - name: Upload signed IPA to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET_NAME: sky
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$AWS_ACCESS_KEY_ID"
+          test -n "$AWS_SECRET_ACCESS_KEY"
+          test -n "$R2_ACCOUNT_ID"
+          R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 cp "$OUTPUT_IPA" "s3://${R2_BUCKET_NAME}/ios.ipa" \
+            --endpoint-url "$R2_ENDPOINT" --no-progress
+          REMOTE_SIZE="$(aws s3api head-object --bucket "$R2_BUCKET_NAME" --key ios.ipa \
+            --endpoint-url "$R2_ENDPOINT" --query ContentLength --output text)"
+          test "$REMOTE_SIZE" = "$(stat -f%z "$OUTPUT_IPA")"
+          echo "Uploaded ios.ipa to R2 (${REMOTE_SIZE} bytes)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean failed R2 multipart uploads
+        if: failure()
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET_NAME: sky
+        shell: bash
+        run: |
+          set +e
+          if [[ -z "$AWS_ACCESS_KEY_ID" || -z "$AWS_SECRET_ACCESS_KEY" || -z "$R2_ACCOUNT_ID" ]]; then
+            echo 'R2 credentials are unavailable; no multipart upload was started.'
+            exit 0
+          fi
+          R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3api list-multipart-uploads --bucket "$R2_BUCKET_NAME" --prefix ios.ipa \
+            --endpoint-url "$R2_ENDPOINT" \
+            --query "Uploads[?Key=='ios.ipa'].[Key,UploadId]" --output text |
+          while read -r key upload_id; do
+            [[ -n "$key" && -n "$upload_id" ]] || continue
+            aws s3api abort-multipart-upload --bucket "$R2_BUCKET_NAME" --key "$key" \
+              --upload-id "$upload_id" --endpoint-url "$R2_ENDPOINT"
+            echo "Aborted incomplete R2 upload: $key ($upload_id)"
+          done
 
       - name: Remove temporary keychain
         if: always()
