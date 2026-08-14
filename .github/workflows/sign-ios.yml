@@ -235,6 +235,8 @@ jobs:
               profile = plistlib.load(handle)
           expiration = profile.get("ExpirationDate")
           now = datetime.datetime.now(datetime.timezone.utc)
+          if expiration is not None and expiration.tzinfo is None:
+              expiration = expiration.replace(tzinfo=datetime.timezone.utc)
           if expiration is None or expiration <= now:
               raise SystemExit(f"Provisioning profile expired: {expiration}")
 
