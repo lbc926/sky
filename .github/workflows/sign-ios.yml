@@ -130,11 +130,15 @@ jobs:
           for old, new, label in patches:
               if len(old) != len(new):
                   raise SystemExit(f"{label}: patch lengths differ")
-              count = data.count(old)
-              if count == 0:
-                  raise SystemExit(f"{label}: source pattern not found")
-              data = data.replace(old, new, 1)
-              print(f"{label}: replaced first of {count} match(es)")
+              old_count = data.count(old)
+              new_count = data.count(new)
+              if old_count:
+                  data = data.replace(old, new, 1)
+                  print(f"{label}: replaced first of {old_count} source match(es)")
+              elif new_count:
+                  print(f"{label}: already patched ({new_count} target match(es)); leaving unchanged")
+              else:
+                  raise SystemExit(f"{label}: neither source nor target pattern was found")
 
           path.write_bytes(data)
           PY
