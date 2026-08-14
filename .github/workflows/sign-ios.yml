@@ -11,6 +11,18 @@ on:
         description: SkyServerHostname override (leave blank to preserve source value)
         required: false
         default: ''
+      cf_bundle_short_version_string:
+        description: CFBundleShortVersionString override (leave blank to preserve source value)
+        required: false
+        default: ''
+      bundle_identifier:
+        description: CFBundleIdentifier override (leave blank to preserve source value)
+        required: false
+        default: ''
+      sky_build_access_key:
+        description: SkyBuildAccessKey override (leave blank to preserve source value)
+        required: false
+        default: ''
       hex_patch_1:
         description: Custom hex patch 1 (OLD=>NEW)
         required: false
@@ -47,6 +59,9 @@ jobs:
     env:
       IPA_URL: ${{ inputs.ipa_url }}
       SKY_SERVER_HOSTNAME: ${{ inputs.sky_server_hostname }}
+      CF_BUNDLE_SHORT_VERSION_STRING: ${{ inputs.cf_bundle_short_version_string }}
+      BUNDLE_IDENTIFIER: ${{ inputs.bundle_identifier }}
+      SKY_BUILD_ACCESS_KEY: ${{ inputs.sky_build_access_key }}
       HEX_PATCH_1: ${{ inputs.hex_patch_1 }}
       HEX_PATCH_2: ${{ inputs.hex_patch_2 }}
       HEX_PATCH_3: ${{ inputs.hex_patch_3 }}
@@ -114,13 +129,34 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -n "$SKY_SERVER_HOSTNAME" ]]; then
-            /usr/libexec/PlistBuddy -c "Set :SkyServerHostname $SKY_SERVER_HOSTNAME" "$INFO_PLIST" 2>/dev/null || \
-              /usr/libexec/PlistBuddy -c "Add :SkyServerHostname string $SKY_SERVER_HOSTNAME" "$INFO_PLIST"
-            echo "SkyServerHostname updated to: $SKY_SERVER_HOSTNAME"
-          else
-            echo 'SkyServerHostname input is blank; preserving the source Info.plist value.'
-          fi
+          python3 - <<'PY'
+          import os
+          import plistlib
+          from pathlib import Path
+
+          path = Path(os.environ["INFO_PLIST"])
+          with path.open("rb") as handle:
+              info = plistlib.load(handle)
+
+          overrides = {
+              "SkyServerHostname": os.environ.get("SKY_SERVER_HOSTNAME", "").strip(),
+              "CFBundleShortVersionString": os.environ.get("CF_BUNDLE_SHORT_VERSION_STRING", "").strip(),
+              "CFBundleIdentifier": os.environ.get("BUNDLE_IDENTIFIER", "").strip(),
+              "SkyBuildAccessKey": os.environ.get("SKY_BUILD_ACCESS_KEY", "").strip(),
+          }
+          changed = False
+          for key, value in overrides.items():
+              if not value:
+                  print(f"{key}: blank; preserving source value")
+                  continue
+              info[key] = value
+              changed = True
+              print(f"{key}: updated")
+
+          if changed:
+              with path.open("wb") as handle:
+                  plistlib.dump(info, handle, fmt=plistlib.FMT_BINARY, sort_keys=False)
+          PY
 
           python3 - <<'PY'
           import os
@@ -196,10 +232,24 @@ jobs:
           path.write_bytes(data)
           PY
 
-          if [[ -n "$SKY_SERVER_HOSTNAME" ]]; then
-            VALUE="$(/usr/libexec/PlistBuddy -c 'Print :SkyServerHostname' "$INFO_PLIST")"
-            test "$VALUE" = "$SKY_SERVER_HOSTNAME"
-          fi
+          python3 - <<'PY'
+          import os
+          import plistlib
+          from pathlib import Path
+
+          with Path(os.environ["INFO_PLIST"]).open("rb") as handle:
+              info = plistlib.load(handle)
+          expected = {
+              "SkyServerHostname": os.environ.get("SKY_SERVER_HOSTNAME", "").strip(),
+              "CFBundleShortVersionString": os.environ.get("CF_BUNDLE_SHORT_VERSION_STRING", "").strip(),
+              "CFBundleIdentifier": os.environ.get("BUNDLE_IDENTIFIER", "").strip(),
+              "SkyBuildAccessKey": os.environ.get("SKY_BUILD_ACCESS_KEY", "").strip(),
+          }
+          for key, value in expected.items():
+              if value and str(info.get(key, "")) != value:
+                  raise SystemExit(f"{key} verification failed")
+          print("Info.plist overrides verified")
+          PY
 
       - name: Inject dylib into main executable
         shell: bash
