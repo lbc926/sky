@@ -150,7 +150,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --disable-pip-version-check --no-input --user 'lief==0.17.6'
+          python3 -m venv "$RUNNER_TEMP/lief-venv"
+          "$RUNNER_TEMP/lief-venv/bin/python" -m pip install \
+            --disable-pip-version-check --no-input 'lief==0.17.6'
 
           mkdir -p "$APP_PATH/Frameworks"
           INJECTED_NAME="DisableBlank.dylib"
@@ -159,7 +161,7 @@ jobs:
           chmod 755 "$INJECTED_PATH"
           echo "INJECTED_PATH=$INJECTED_PATH" >> "$GITHUB_ENV"
 
-          python3 - <<'PY'
+          "$RUNNER_TEMP/lief-venv/bin/python" - <<'PY'
           import os
           from pathlib import Path
           import lief
