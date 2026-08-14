@@ -11,8 +11,8 @@ on:
         description: SkyServerHostname override (leave blank to preserve source value)
         required: false
         default: ''
-      cf_bundle_short_version_string:
-        description: CFBundleShortVersionString override (leave blank to preserve source value)
+      cf_bundle_version:
+        description: CFBundleVersion override (leave blank to preserve source value)
         required: false
         default: ''
       bundle_identifier:
@@ -59,7 +59,7 @@ jobs:
     env:
       IPA_URL: ${{ inputs.ipa_url }}
       SKY_SERVER_HOSTNAME: ${{ inputs.sky_server_hostname }}
-      CF_BUNDLE_SHORT_VERSION_STRING: ${{ inputs.cf_bundle_short_version_string }}
+      CF_BUNDLE_VERSION: ${{ inputs.cf_bundle_version }}
       BUNDLE_IDENTIFIER: ${{ inputs.bundle_identifier }}
       SKY_BUILD_ACCESS_KEY: ${{ inputs.sky_build_access_key }}
       HEX_PATCH_1: ${{ inputs.hex_patch_1 }}
@@ -140,7 +140,7 @@ jobs:
 
           overrides = {
               "SkyServerHostname": os.environ.get("SKY_SERVER_HOSTNAME", "").strip(),
-              "CFBundleShortVersionString": os.environ.get("CF_BUNDLE_SHORT_VERSION_STRING", "").strip(),
+              "CFBundleVersion": os.environ.get("CF_BUNDLE_VERSION", "").strip(),
               "CFBundleIdentifier": os.environ.get("BUNDLE_IDENTIFIER", "").strip(),
               "SkyBuildAccessKey": os.environ.get("SKY_BUILD_ACCESS_KEY", "").strip(),
           }
@@ -241,7 +241,7 @@ jobs:
               info = plistlib.load(handle)
           expected = {
               "SkyServerHostname": os.environ.get("SKY_SERVER_HOSTNAME", "").strip(),
-              "CFBundleShortVersionString": os.environ.get("CF_BUNDLE_SHORT_VERSION_STRING", "").strip(),
+              "CFBundleVersion": os.environ.get("CF_BUNDLE_VERSION", "").strip(),
               "CFBundleIdentifier": os.environ.get("BUNDLE_IDENTIFIER", "").strip(),
               "SkyBuildAccessKey": os.environ.get("SKY_BUILD_ACCESS_KEY", "").strip(),
           }
