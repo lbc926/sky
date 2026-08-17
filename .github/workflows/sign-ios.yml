@@ -118,6 +118,12 @@ jobs:
           EXECUTABLE_PATH="$APP_PATH/$EXECUTABLE_NAME"
           test -f "$EXECUTABLE_PATH"
 
+          if otool -l "$EXECUTABLE_PATH" | awk '$1 == "cryptid" && $2 != 0 { encrypted = 1 } END { exit encrypted ? 0 : 1 }'; then
+            echo '::error::Source IPA executable is encrypted (cryptid != 0). Re-signing an encrypted App Store binary causes an immediate launch crash.'
+            exit 1
+          fi
+          echo "Source executable is decrypted (all cryptid values are 0)."
+
           echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
           echo "INFO_PLIST=$INFO_PLIST" >> "$GITHUB_ENV"
           echo "EXECUTABLE_NAME=$EXECUTABLE_NAME" >> "$GITHUB_ENV"
@@ -137,6 +143,19 @@ jobs:
           path = Path(os.environ["INFO_PLIST"])
           with path.open("rb") as handle:
               info = plistlib.load(handle)
+
+          # Keep a trusted copy of identity/display metadata before applying any
+          # user-requested overrides.  In particular, a blank Bundle Identifier
+          # must mean "preserve the source value" throughout the whole workflow.
+          preserved_keys = (
+              "CFBundleIdentifier",
+              "CFBundleDisplayName",
+              "CFBundleName",
+              "TeamName",
+          )
+          original = {key: info[key] for key in preserved_keys if key in info}
+          with Path("original-info.plist").open("wb") as handle:
+              plistlib.dump(original, handle, fmt=plistlib.FMT_XML, sort_keys=False)
 
           overrides = {
               "SkyServerHostname": os.environ.get("SKY_SERVER_HOSTNAME", "").strip(),
@@ -239,15 +258,31 @@ jobs:
 
           with Path(os.environ["INFO_PLIST"]).open("rb") as handle:
               info = plistlib.load(handle)
+          with Path("original-info.plist").open("rb") as handle:
+              original = plistlib.load(handle)
           expected = {
               "SkyServerHostname": os.environ.get("SKY_SERVER_HOSTNAME", "").strip(),
               "CFBundleVersion": os.environ.get("CF_BUNDLE_VERSION", "").strip(),
-              "CFBundleIdentifier": os.environ.get("BUNDLE_IDENTIFIER", "").strip(),
               "SkyBuildAccessKey": os.environ.get("SKY_BUILD_ACCESS_KEY", "").strip(),
           }
           for key, value in expected.items():
               if value and str(info.get(key, "")) != value:
                   raise SystemExit(f"{key} verification failed")
+
+          requested_bundle = os.environ.get("BUNDLE_IDENTIFIER", "").strip()
+          expected_bundle = requested_bundle or str(original.get("CFBundleIdentifier", ""))
+          if not expected_bundle:
+              raise SystemExit("Source Info.plist has no CFBundleIdentifier")
+          if str(info.get("CFBundleIdentifier", "")) != expected_bundle:
+              raise SystemExit("CFBundleIdentifier was changed unexpectedly")
+
+          for key in ("CFBundleDisplayName", "CFBundleName", "TeamName"):
+              if key in original and info.get(key) != original[key]:
+                  raise SystemExit(f"{key} was changed unexpectedly")
+
+          policy = "explicit override" if requested_bundle else "preserved from source"
+          print(f"Bundle ID policy verified ({policy}): {expected_bundle}")
+          print("App/team display metadata preserved")
           print("Info.plist overrides verified")
           PY
 
@@ -330,11 +365,11 @@ jobs:
           cp "$PROFILE_FILE" "$APP_PATH/embedded.mobileprovision"
 
           python3 - <<'PY'
+          import copy
           import datetime
           import fnmatch
           import os
           import plistlib
-          import subprocess
 
           with open("profile.plist", "rb") as handle:
               profile = plistlib.load(handle)
@@ -345,34 +380,45 @@ jobs:
           if expiration is None or expiration <= now:
               raise SystemExit(f"Provisioning profile expired: {expiration}")
 
-          entitlements = profile["Entitlements"]
-          with open("entitlements.plist", "wb") as handle:
-              plistlib.dump(entitlements, handle, fmt=plistlib.FMT_XML, sort_keys=False)
-
-          app_id = str(entitlements.get("application-identifier", ""))
+          profile_entitlements = profile["Entitlements"]
+          app_id = str(profile_entitlements.get("application-identifier", ""))
           if "." not in app_id:
               raise SystemExit("Provisioning profile has no valid application-identifier")
-          profile_bundle = app_id.split(".", 1)[1]
-          info_plist = os.environ["INFO_PLIST"]
-          current_bundle = subprocess.check_output(
-              ["/usr/libexec/PlistBuddy", "-c", "Print :CFBundleIdentifier", info_plist],
-              text=True,
-          ).strip()
+          team_prefix, profile_bundle = app_id.split(".", 1)
+          with open(os.environ["INFO_PLIST"], "rb") as handle:
+              current_bundle = str(plistlib.load(handle).get("CFBundleIdentifier", "")).strip()
+          if not current_bundle:
+              raise SystemExit("App Info.plist has no CFBundleIdentifier")
+
           if not fnmatch.fnmatchcase(current_bundle, profile_bundle):
-              if "*" in profile_bundle:
-                  raise SystemExit(
-                      f"Bundle ID {current_bundle} does not match profile pattern {profile_bundle}"
-                  )
-              subprocess.run(
-                  ["/usr/libexec/PlistBuddy", "-c", f"Set :CFBundleIdentifier {profile_bundle}", info_plist],
-                  check=True,
+              raise SystemExit(
+                  f"Bundle ID {current_bundle} does not match profile {profile_bundle}. "
+                  "The workflow will not replace the Bundle ID; use a compatible "
+                  "provisioning profile or enter an explicit Bundle Identifier."
               )
-              current_bundle = profile_bundle
+
+          # Provisioning profiles commonly contain wildcard values.  codesign
+          # must receive concrete identifiers for the bundle being signed or the
+          # installed app can terminate immediately during launch validation.
+          entitlements = copy.deepcopy(profile_entitlements)
+          if str(entitlements.get("application-identifier", "")).endswith(".*"):
+              entitlements["application-identifier"] = f"{team_prefix}.{current_bundle}"
+
+          keychain_groups = entitlements.get("keychain-access-groups")
+          if isinstance(keychain_groups, list):
+              entitlements["keychain-access-groups"] = [
+                  f"{team_prefix}.{current_bundle}" if str(group).endswith(".*") else group
+                  for group in keychain_groups
+              ]
+
+          with open("entitlements.plist", "wb") as handle:
+              plistlib.dump(entitlements, handle, fmt=plistlib.FMT_XML, sort_keys=False)
 
           print("Profile:", profile.get("Name"))
           print("Profile expires:", expiration.isoformat())
           print("Bundle ID:", current_bundle)
-          print("Team ID:", entitlements.get("com.apple.developer.team-identifier"))
+          print("Signing Team ID (from profile):", entitlements.get("com.apple.developer.team-identifier"))
+          print("Application identifier:", entitlements.get("application-identifier"))
           PY
 
           echo "Signing identity: $SIGNING_IDENTITY"
@@ -383,10 +429,8 @@ jobs:
           set -euo pipefail
           rm -rf "$APP_PATH/_CodeSignature"
 
-          # A nested app extension requires its own matching provisioning profile.
-          # The supplied archive contains only the main-app profile, so remove
-          # optional extensions instead of producing an invalid mixed-profile IPA.
-          rm -rf "$APP_PATH/PlugIns" "$APP_PATH/Watch"
+          # Preserve the original package tree.  Do not delete PlugIns, Watch,
+          # resources, or other payload content to make signing appear successful.
 
           while IFS= read -r -d '' item; do
             echo "Signing nested item: $item"
@@ -415,11 +459,70 @@ jobs:
             --entitlements entitlements.plist \
             "$APP_PATH"
 
-          codesign --verify --deep --verbose=2 "$APP_PATH"
-          if ! codesign --verify --deep --strict --verbose=2 "$APP_PATH"; then
-            echo '::warning::Strict validation is not supported by one or more legacy bundled Mach-O files; standard deep signature verification passed.'
-          fi
+          codesign --verify --strict --verbose=2 "$INJECTED_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
           codesign -d --verbose=4 "$APP_PATH"
+          codesign -d --entitlements :- "$APP_PATH" > signed-entitlements.plist 2>/dev/null
+          test -s signed-entitlements.plist
+
+          python3 - <<'PY'
+          import os
+          import plistlib
+          from pathlib import Path
+
+          with Path(os.environ["INFO_PLIST"]).open("rb") as handle:
+              info = plistlib.load(handle)
+          with Path("original-info.plist").open("rb") as handle:
+              original = plistlib.load(handle)
+          with Path("entitlements.plist").open("rb") as handle:
+              expected_entitlements = plistlib.load(handle)
+          with Path("signed-entitlements.plist").open("rb") as handle:
+              signed_entitlements = plistlib.load(handle)
+
+          requested_bundle = os.environ.get("BUNDLE_IDENTIFIER", "").strip()
+          expected_bundle = requested_bundle or str(original.get("CFBundleIdentifier", ""))
+          actual_bundle = str(info.get("CFBundleIdentifier", ""))
+          if actual_bundle != expected_bundle:
+              raise SystemExit(
+                  f"Final Bundle ID changed unexpectedly: {actual_bundle} != {expected_bundle}"
+              )
+
+          expected_app_id = str(expected_entitlements.get("application-identifier", ""))
+          signed_app_id = str(signed_entitlements.get("application-identifier", ""))
+          if not expected_app_id or signed_app_id != expected_app_id:
+              raise SystemExit(
+                  f"Signed application-identifier mismatch: {signed_app_id} != {expected_app_id}"
+              )
+          if not signed_app_id.endswith(f".{actual_bundle}"):
+              raise SystemExit(
+                  f"Signed application-identifier does not contain Bundle ID {actual_bundle}"
+              )
+
+          expected_team = str(
+              expected_entitlements.get("com.apple.developer.team-identifier", "")
+          )
+          signed_team = str(
+              signed_entitlements.get("com.apple.developer.team-identifier", "")
+          )
+          if expected_team and signed_team != expected_team:
+              raise SystemExit(f"Signed Team ID mismatch: {signed_team} != {expected_team}")
+
+          for key in ("CFBundleDisplayName", "CFBundleName", "TeamName"):
+              if key in original and info.get(key) != original[key]:
+                  raise SystemExit(f"Final {key} changed unexpectedly")
+
+          print("Final Bundle ID:", actual_bundle)
+          print("Final application identifier:", signed_app_id)
+          print("Final signing Team ID:", signed_team or "not present")
+          print("App/team display metadata preserved")
+          print("Injected dylib and complete app signatures verified")
+          PY
+
+          if otool -l "$EXECUTABLE_PATH" | awk '$1 == "cryptid" && $2 != 0 { encrypted = 1 } END { exit encrypted ? 0 : 1 }'; then
+            echo '::error::Final executable unexpectedly has cryptid != 0.'
+            exit 1
+          fi
+          echo "Final executable remains decrypted (all cryptid values are 0)."
 
       - name: Package signed IPA
         shell: bash
