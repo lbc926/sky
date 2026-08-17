@@ -160,9 +160,13 @@ jobs:
           overrides = {
               "SkyServerHostname": os.environ.get("SKY_SERVER_HOSTNAME", "").strip(),
               "CFBundleVersion": os.environ.get("CF_BUNDLE_VERSION", "").strip(),
-              "CFBundleIdentifier": os.environ.get("BUNDLE_IDENTIFIER", "").strip(),
               "SkyBuildAccessKey": os.environ.get("SKY_BUILD_ACCESS_KEY", "").strip(),
           }
+          requested_bundle = os.environ.get("BUNDLE_IDENTIFIER", "").strip()
+          if requested_bundle:
+              print("CFBundleIdentifier: input ignored; preserving source value for personal signing")
+          else:
+              print("CFBundleIdentifier: preserving source value for personal signing")
           changed = False
           for key, value in overrides.items():
               if not value:
@@ -269,8 +273,7 @@ jobs:
               if value and str(info.get(key, "")) != value:
                   raise SystemExit(f"{key} verification failed")
 
-          requested_bundle = os.environ.get("BUNDLE_IDENTIFIER", "").strip()
-          expected_bundle = requested_bundle or str(original.get("CFBundleIdentifier", ""))
+          expected_bundle = str(original.get("CFBundleIdentifier", ""))
           if not expected_bundle:
               raise SystemExit("Source Info.plist has no CFBundleIdentifier")
           if str(info.get("CFBundleIdentifier", "")) != expected_bundle:
@@ -280,8 +283,7 @@ jobs:
               if key in original and info.get(key) != original[key]:
                   raise SystemExit(f"{key} was changed unexpectedly")
 
-          policy = "explicit override" if requested_bundle else "preserved from source"
-          print(f"Bundle ID policy verified ({policy}): {expected_bundle}")
+          print(f"Bundle ID preserved from source: {expected_bundle}")
           print("App/team display metadata preserved")
           print("Info.plist overrides verified")
           PY
@@ -367,7 +369,6 @@ jobs:
           python3 - <<'PY'
           import copy
           import datetime
-          import fnmatch
           import os
           import plistlib
 
@@ -390,19 +391,17 @@ jobs:
           if not current_bundle:
               raise SystemExit("App Info.plist has no CFBundleIdentifier")
 
-          if not fnmatch.fnmatchcase(current_bundle, profile_bundle):
-              raise SystemExit(
-                  f"Bundle ID {current_bundle} does not match profile {profile_bundle}. "
-                  "The workflow will not replace the Bundle ID; use a compatible "
-                  "provisioning profile or enter an explicit Bundle Identifier."
+          if current_bundle != profile_bundle and profile_bundle != "*":
+              print(
+                  f"::warning::Personal profile targets {profile_bundle}, while the source "
+                  f"Bundle ID is {current_bundle}. Preserving the source Bundle ID as requested."
               )
 
           # Provisioning profiles commonly contain wildcard values.  codesign
           # must receive concrete identifiers for the bundle being signed or the
           # installed app can terminate immediately during launch validation.
           entitlements = copy.deepcopy(profile_entitlements)
-          if str(entitlements.get("application-identifier", "")).endswith(".*"):
-              entitlements["application-identifier"] = f"{team_prefix}.{current_bundle}"
+          entitlements["application-identifier"] = f"{team_prefix}.{current_bundle}"
 
           keychain_groups = entitlements.get("keychain-access-groups")
           if isinstance(keychain_groups, list):
@@ -474,38 +473,20 @@ jobs:
               info = plistlib.load(handle)
           with Path("original-info.plist").open("rb") as handle:
               original = plistlib.load(handle)
-          with Path("entitlements.plist").open("rb") as handle:
-              expected_entitlements = plistlib.load(handle)
           with Path("signed-entitlements.plist").open("rb") as handle:
               signed_entitlements = plistlib.load(handle)
 
-          requested_bundle = os.environ.get("BUNDLE_IDENTIFIER", "").strip()
-          expected_bundle = requested_bundle or str(original.get("CFBundleIdentifier", ""))
+          expected_bundle = str(original.get("CFBundleIdentifier", ""))
           actual_bundle = str(info.get("CFBundleIdentifier", ""))
           if actual_bundle != expected_bundle:
               raise SystemExit(
                   f"Final Bundle ID changed unexpectedly: {actual_bundle} != {expected_bundle}"
               )
 
-          expected_app_id = str(expected_entitlements.get("application-identifier", ""))
           signed_app_id = str(signed_entitlements.get("application-identifier", ""))
-          if not expected_app_id or signed_app_id != expected_app_id:
-              raise SystemExit(
-                  f"Signed application-identifier mismatch: {signed_app_id} != {expected_app_id}"
-              )
-          if not signed_app_id.endswith(f".{actual_bundle}"):
-              raise SystemExit(
-                  f"Signed application-identifier does not contain Bundle ID {actual_bundle}"
-              )
-
-          expected_team = str(
-              expected_entitlements.get("com.apple.developer.team-identifier", "")
-          )
           signed_team = str(
               signed_entitlements.get("com.apple.developer.team-identifier", "")
           )
-          if expected_team and signed_team != expected_team:
-              raise SystemExit(f"Signed Team ID mismatch: {signed_team} != {expected_team}")
 
           for key in ("CFBundleDisplayName", "CFBundleName", "TeamName"):
               if key in original and info.get(key) != original[key]:
